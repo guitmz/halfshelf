@@ -30,24 +30,26 @@ You need `fasm`, and `gcc` for the test programs.
 make
 ```
 
+This builds `halfshelf` and `headshelf` in the repo root and `strip_headers` in `build/`.
+
 ## Usage
 
-Run a SHELF binary:
+Run a SHELF binary.
 
 ```sh
 ./halfshelf /path/to/program [args...]
 ```
 
-Strip the headers and run the headless payload:
+Strip the headers and run the headless payload.
 
 ```sh
-/tmp/strip_headers program program.payload program.meta
+build/strip_headers program program.payload program.meta
 ./headshelf program.payload program.meta [args...]
 ```
 
 Use `--headless-bin` with `strip_headers` for a binary metadata file instead of text. `headshelf` detects the format by itself.
 
-Run the payload straight from stdin:
+Run the payload straight from stdin.
 
 ```sh
 cat program.payload | ./headshelf --memfd program.meta [args...]
@@ -57,7 +59,7 @@ Set `HALFSHELF_DEBUG=1` to print what the loader is doing.
 
 ## Building a SHELF binary
 
-The test programs show how. They are linked as static PIE with the linker script in `tests/static-pie.ld`:
+The test programs show how. They are linked as static PIE with the linker script in `tests/static-pie.ld`.
 
 ```sh
 gcc -fno-asynchronous-unwind-tables -fno-unwind-tables \
@@ -72,7 +74,7 @@ make run
 make corrupt-tests
 ```
 
-`make run` builds the samples into `/tmp` and runs them through both loaders, in file mode and memfd mode, checking the exit code. `make corrupt-tests` feeds broken metadata and oversized files to make sure the loaders refuse them. `make inspect` shows the ELF layout of the samples and `make clean` removes everything.
+`make run` builds the samples into `build/` and runs them through both loaders, in file mode and memfd mode, checking the exit code. One sample, `tests/test_nolibc.c`, has no libc, so nothing in it redoes the loader's relocation, TLS or stack alignment work, and it only passes when the loader got those right. `make corrupt-tests` feeds broken metadata, a bad program header offset and oversized files, and checks that each one is refused with exit status 1 instead of a crash. `make inspect` shows the ELF layout of the samples and `make clean` removes everything.
 
 ## Layout
 
@@ -80,5 +82,5 @@ make corrupt-tests
 * `headshelf.asm` is the headless loader
 * `strip_headers/` holds the header stripping tool
 * `utils.inc` holds syscall numbers, constants and structures
-* `loader/` holds shared stages: validation, relocation, stack setup and data
+* `loader/` holds shared code for validation, relocation, stack setup, debug tracing, error exits and data
 * `tests/` holds the sample programs and linker script

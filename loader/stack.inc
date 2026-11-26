@@ -5,74 +5,74 @@
 ;   * rebuild a kernel like initial stack with patched auxv values
 
 prepareTlsAndStack:
-    ; If PT_INTERP is in charge, ld-linux will sort TLS out later. The manual
-    ; bootstrap below is only for the direct entry paths where we jmp in
-    ; ourselves
-    cmp byte [hasInterp], 0
-    jne prepareStackImage
     cmp byte [hasTls], 0
     je prepareStackImage
+    ; An initializer bigger than the block would make the zero fill below
+    ; count backwards through memory
+    mov rax, [tlsFilesz]
+    cmp rax, [tlsMemsz]
+    ja invalidTls
     lea rsi, [dbgTlsMsg]
     mov rdx, dbgTlsMsgLen
     call debugWrite
-    ; PT_TLS alignment can be zero or just plain tiny. We normalize it here so
-    ; the synthetic layout has a sane x64 baseline
+    ; x64 TLS is variant II. The block ends at the thread pointer and starts at
+    ; tp minus roundup(p_memsz, p_align), the same offset the linker baked into
+    ; every %fs relative access. Placing it at tp minus p_memsz shifts every
+    ; variable whenever p_memsz is not a multiple of p_align
     mov rax, [tlsAlign]
     test rax, rax
     jnz .tlsAlignReady
     mov rax, 1                                    ; zero = no special alignment
     .tlsAlignReady:
-    cmp rax, 16                                   ; keep the alignment at least 16 bytes for sane x64 startup state
+    mov rcx, [tlsMemsz]
+    add rcx, rax
+    dec rcx
+    mov rdx, rax
+    neg rdx
+    and rcx, rdx
+    mov [tlsMemszAligned], rcx
+    cmp rax, 16                                   ; the TCB itself still gets at least 16 byte alignment
     jae .tlsAlignSized
     mov rax, 16
     .tlsAlignSized:
-    ; Layout is:
+    ; Layout is
     ;   [TLS block][TCB][small DTV]
     ;
     ; Then FS points at the TCB. Minimal, yes, but enough for the cases we care
-    mov [tlsAlignWork], rax                       ; remember the normalized alignment for later address arithmetic
-    mov rcx, [tlsMemsz]
+    mov [tlsAlignWork], rax
+    mov rcx, [tlsMemszAligned]
     add rcx, TLS_TCB_SIZE + TLS_DTV_SIZE          ; reserve extra room for the TCB and tiny DTV after the TLS block
-    add rcx, rax                                   ; add enough slack to round the TCB up to its required alignment
+    add rcx, rax                                  ; add enough slack to round the TCB up to its required alignment
     add rcx, 15
-    and rcx, -16                                  ;  final anonymous mapping length for the direct entry TLS area
-    mov rdi, 0                                   ; let the kernel choose the TLS mapping address
+    and rcx, -16                                  ; final anonymous mapping length for the direct entry TLS area
+    mov rdi, 0                                    ; let the kernel choose the TLS mapping address
     mov rsi, rcx
-    mov rdx, PROT_READ or PROT_WRITE             ; direct entry TLS only needs read/write permissions
-    mov r10, MAP_PRIVATE or MAP_ANON             ; anonymous private memory is enough for synthetic TLS
-    mov r8, -1                                     ; anonymous mmap ignores the file descriptor slot
+    mov rdx, PROT_READ or PROT_WRITE
+    mov r10, MAP_PRIVATE or MAP_ANON
+    mov r8, -1
     xor r9, r9
     mov rax, SYS_MMAP
     syscall
     test rax, rax
     js mmapFailed
-    ; Place the TCB right after the TLS block, align it up, and keep the block
-    ; itself immediately before it. That matches the x64 model glibc and
-    ; static PIE startup code expect closely enough for our needs
-    mov rdi, rax                                  ; start from the base of the anonymous TLS mapping
-    add rdi, [tlsMemsz]                           ; move past the TLS block to where the TCB will begin
+    ; TCB goes right after the rounded block, aligned up. The TCB alignment is
+    ; a multiple of p_align, so the block start below is p_align aligned too
+    mov rdi, rax
+    add rdi, [tlsMemszAligned]
     mov rax, [tlsAlignWork]
-    dec rax                                       ; convert alignment into a low bits mask helper
-    add rdi, rax                                  ; bias upward before masking so the result rounds up
-    not rax                                       ; invert the mask so aligned low bits become zero
+    dec rax
+    add rdi, rax
+    not rax
     and rdi, rax
     mov [tlsTcb], rdi
     mov rax, rdi
-    sub rax, [tlsMemsz]                           ; step backward by tlsMemsz to recover the TLS block base
+    sub rax, [tlsMemszAligned]
     mov [tlsBlock], rax
     mov rdi, rax
-    cmp word [ehdr.type], ET_EXEC
-    jne .tlsCopyFromMapped
-    ; ET_EXEC has not been remapped yet at this point, so its TLS initializer
-    ; still has to come from the staged file buffer
-    lea rsi, [buffer]
-    add rsi, [tlsOffset]
-    jmp .tlsCopyReady
-    .tlsCopyFromMapped:
     mov rsi, [baseAddr]
     add rsi, [tlsVaddr]
-    .tlsCopyReady:
-    ; Copy the initializer bytes, then zero the tail if there is one
+    ; Copy the initializer bytes, then zero the tail if there is one. The
+    ; padding between the block and the TCB is already zero from mmap
     mov rcx, [tlsFilesz]
     rep movsb
     mov rcx, [tlsMemsz]
@@ -190,19 +190,11 @@ prepareStackImage:
     mov rax, [stackAddr]
     add rax, STACK_SIZE
     and rax, -16
+    ; The ABI wants rsp 16 byte aligned at entry. Below the top go auxv (a
+    ; multiple of 16 bytes) and argc, argv, NULL, envp, NULL, which is
+    ; argc + envc + 3 words. Drop one extra word when that count is odd
     mov rcx, [targetEnvc]
     add rcx, [targetArgc]
-
-    ; The stack is built downward from the top of the mapping. The exact top
-    ; alignment differs a little between directentry and PT_INTERP paths, so
-    ; we settle that before laying out the tables
-    cmp byte [hasInterp], 0
-    jne .stackTopInterp
-    test rcx, 1
-    jz .stackTopReady
-    sub rax, 8
-    jmp .stackTopReady
-    .stackTopInterp:
     test rcx, 1
     jnz .stackTopReady
     sub rax, 8
@@ -244,14 +236,14 @@ prepareStackImage:
         movzx r8, word [ehdr.phnum]               ; AT_PHNUM should report the main executable's phdr count
         jmp .auxStore
         .auxNotPhnum:
-        cmp rax, AT_BASE                          ; AT_BASE points at the interpreter base when PT_INTERP exists
+        cmp rax, AT_BASE
         jne .auxNotBase
-        mov r8, [interpBaseAddr]                  ; patch in the mapped ld-linux base address (or 0 for direct entry)
+        xor r8d, r8d                              ; no interpreter is ever loaded, so there is no interpreter base
         jmp .auxStore
         .auxNotBase:
         cmp rax, AT_ENTRY                          ; AT_ENTRY should always describe the main programs entry point
         jne .auxNotEntry
-        mov r8, [baseAddr]                         ; start from the main image load bias (0 for ET_EXEC)
+        mov r8, [baseAddr]
         add r8, [ehdr.entry]
         jmp .auxStore
         .auxNotEntry:
@@ -408,39 +400,18 @@ prepareStackImage:
     mov [rdi], rax
     mov [newStackPtr], rdi                         ; remember the exact rsp value that should be installed at handoff
 
-    ; Final handoff selection.
-    ;
-    ; After this point the stack image is complete. We can close the staged
-    ; file and choose the final entry mechanism:
-    ;   * ET_EXEC -> fork + scratch trampoline
-    ;   * PT_INTERP -> jump into ld-linux
-    ;   * otherwise -> jump directly to the main executable entry point
-    ; From this point on the staged file descriptor is no longer needed. All
-    ; target bytes that matter have already been copied into anonymous mappings.
+    ; The stack image is complete and every target byte that matters already
+    ; lives in anonymous mappings, so the staged file descriptor can go
     mov rdi, [targetFd]
     mov rax, SYS_CLOSE
     syscall
     test rax, rax                               ; negative return means close(2) failed
     js closeFailed
 
-    ; ET_EXEC targets must switch through the child trampoline so they can
-    ; claim fixed virtual addresses without destroying the running loader
-    cmp word [ehdr.type], ET_EXEC
-    je forkTransformExec
-    cmp byte [hasInterp], 0                       ; PT_INTERP means we jump to ld-linux instead of the main entry point
-    jne .jumpInterp
     mov r11, [baseAddr]
     add r11, [ehdr.entry]                         ; direct entry runtime address of the main executable's entry point
     lea rsi, [dbgJumpMainMsg]
     mov rdx, dbgJumpMainMsgLen
-    mov rax, r11
-    call debugPrintHexLine
-    ENTER_PREPARED_IMAGE newStackPtr, r11
-    .jumpInterp:
-    mov r11, [interpBaseAddr]
-    add r11, [interpEhdr.entry]                   ; runtime entry address of ld-linux
-    lea rsi, [dbgJumpInterpMsg]
-    mov rdx, dbgJumpInterpMsgLen
     mov rax, r11
     call debugPrintHexLine
     ENTER_PREPARED_IMAGE newStackPtr, r11

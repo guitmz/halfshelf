@@ -153,8 +153,8 @@ entry $
     mov rdx, [fileStat.st_size]
     mov rax, SYS_READ
     syscall
-    test rax, rax
-    jle fileReadFailed                                ; treats a zero read the same as an outright failure, an empty file can't be a valid ELF anyway
+    cmp rax, [fileStat.st_size]                       ; a short read would leave the zeroed tail of buf posing as file bytes
+    jne fileReadFailed
 
     cmp dword [buf + EHDR.magic], 0x464c457f          ; 0x464c457f means \x7fELF in a little-endian 
     jne invalidElf
@@ -188,6 +188,15 @@ entry $
     imul rdx, rcx
     add rax, rdx
     mov [headerSpan], rax
+
+    ; The phdr table must lie inside the file we actually read, otherwise the
+    ; scan below walks past buf. phoff is checked first so the sum cannot wrap
+    mov rax, [phoffValue]
+    cmp rax, [fileStat.st_size]
+    ja invalidShelf
+    mov rax, [headerSpan]
+    cmp rax, [fileStat.st_size]
+    ja invalidShelf
 
     ; walk every phdr once, remembering the first PT_LOAD/PT_DYNAMIC/PT_TLS
     ; entry of each kind, a SHELF image is expected to carry at most one of each
@@ -253,6 +262,14 @@ entry $
     jne invalidShelf
     cmp qword [loadVaddrValue], 0
     jne invalidShelf
+    ; The PT_LOAD file bytes must exist in the input and contain the header
+    ; span, otherwise a truncated ELF would turn into a payload padded with
+    ; zeros that headshelf happily runs
+    mov rax, [loadFileszValue]
+    cmp rax, [fileStat.st_size]
+    ja invalidShelf
+    cmp rax, [headerSpan]
+    jb invalidShelf
 
     ; everything in the PT_LOAD past the header/phdr table is the payload the
     ; loader will map back in later

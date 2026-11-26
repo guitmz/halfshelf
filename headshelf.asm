@@ -24,137 +24,51 @@ entry $
     ; at all, because the loader stages it directly from stdin into
     ; memory and mirrors those bytes into a memfd file descriptor
     mov rcx, [rsp]                            ; argc is always sits [rsp] before any pushes
-    mov r8, rcx                                  ; preserve the original startup argc for later envp discovery math
     cmp rcx, 3                                ; we want 3 args
     jl usage
+    lea rax, [rsp + rcx * 8 + 16]             ; envp starts right after argv[] and its NULL
+    mov [targetEnvp], rax
 
-    mov rax, [rsp + 16]                          ; argv[1] decides which headless input mode we are using
-    mov rbx, rax                                 ; preserve argv[1] while we compare it against "--memfd"
-    lea rdi, [memfdArg]                       ; rdi -> the literal --memfd bytes to compare against
-    mov rcx, memfdArgLen                      ; 7 bytes, the length of --memfd
+    ; argv[1] is the payload path, or exactly "--memfd". memfdArg carries its
+    ; NUL, so a payload file named "--memfd.bin" still counts as file mode
+    mov byte [memfdMode], 0
+    mov rbx, [rsp + 16]
+    lea rdi, [memfdArg]
+    mov rcx, memfdArgLen
     .checkMemfdMode:
-        test rcx, rcx                            ; stop once every byte of "--memfd" matched
+        test rcx, rcx
         jz .memfdMode
-        mov al, [rbx]                            ; load the current argv[1] byte into al
-        mov dl, [rdi]                            ; load the matching literal byte from "--memfd"
-        cmp al, dl                              ; mismatch means this is the normal file mode
+        mov al, [rbx]
+        cmp al, [rdi]
         jne .fileMode
         inc rbx
         inc rdi
         dec rcx
         jmp .checkMemfdMode
-
+    .memfdMode:
+    mov byte [memfdMode], 1
+    lea rax, [memfdTargetPath]                   ; synthetic argv[0] presented to the loaded payload
+    jmp .modeReady
     .fileMode:
-    mov rax, [rsp]                            ; re-read argc, the earlier copy in r8 stays untouched for the envp offset math later
-    sub rax, 2                                   ; target argc = payload path + forwarded args after dropping metadata path
-    mov [targetArgc], rax
     mov rax, [rsp + 16]                          ; argv[1] becomes the target visible argv[0] pathname
+    .modeReady:
     mov [targetPath], rax
     mov rax, [rsp + 24]                          ; argv[2] is the metadata sidecar pathname
     mov [metaPath], rax
-    jmp .argsReady
-
-    .memfdMode:
-    mov rax, [rsp]                            ; same re-read as the file-mode branch above
-    sub rax, 2                                   ; target argc = synthetic argv[0] + forwarded args after dropping "--memfd" and meta path
+    mov rax, [rsp]
+    sub rax, 2                                   ; the loader's own argv[0] and the metadata path are dropped
     mov [targetArgc], rax
-    lea rax, [memfdTargetPath]                   ; synthetic argv[0] presented to the loaded payload
-    mov [targetPath], rax
-    mov rax, [rsp + 24]                          ; argv[2] is still the metadata sidecar pathname
-    mov [metaPath], rax
 
-    .argsReady:
-    lea rax, [rsp + r8 * 8 + 16]              ; envp starts right after argv[] and its NULL terminator: argv[0] is at rsp+8, so envp = rsp + 8 + argc*8 + 8
-    mov [targetEnvp], rax                         ; temporarily remember the loader's original envp start
-
-    ; Rebuild a contiguous argv/envp/auxv scratch block that drops the metadata
-    ; pathname while still matching the layout stack.inc expects:
-    ;   argv[]
-    ;   NULL
-    ;   envp[]
-    ;   NULL
-    ;   auxv[]
-    lea rdi, [argvScratch]                    ; rdi walks forward through this scratch block as each argv/envp/auxv entry gets appended below
+    ; Drop the two loader arguments in place. The argv[2] slot becomes the
+    ; target's argv[0], and the forwarded args, NULL, envp and auxv already
+    ; follow it in the shape stack.inc expects
     mov rax, [targetPath]
-    mov [rdi], rax
-    add rdi, 8
-    lea rsi, [rsp + 32]                       ; first forwarded arg, since argv[1]/argv[2] (mode flag or payload path, and meta path) get dropped
-    mov rdx, [targetArgc]
-    dec rdx                                   ; argv[0] was already written above, so only the remaining entries need copying
-    .copyArgvScratch:
-        test rdx, rdx
-        jz .argvScratchDone                   ; rdx counts down the remaining argv entries, zero means every forwarded arg has been copied
-        mov rax, [rsi]
-        mov [rdi], rax
-        add rsi, 8
-        add rdi, 8
-        dec rdx
-        jmp .copyArgvScratch
-    .argvScratchDone:
-    mov qword [rdi], 0                        ; NULL-terminates argv[] before the envp[] entries that follow in this same scratch block
-    add rdi, 8
-    mov rsi, [targetEnvp]                     ; rsi now walks the loader's original envp instead of the argv array
-    .copyEnvScratch:
-        mov rax, [rsi]
-        mov [rdi], rax
-        add rsi, 8
-        add rdi, 8
-        test rax, rax                         ; loop copies through the NULL terminator itself so the scratch block ends with a proper envp terminator
-        jnz .copyEnvScratch
-    ; rsi now points at the first auxv entry in the loader's original startup
-    ; stack. Copy the auxv pairs verbatim so stack.inc can parse them from the
-    ; same contiguous scratch block shape it expects from a normal process
-    ; entry layout
-    .copyAuxScratch:
-        mov rax, [rsi]
-        mov rdx, [rsi + 8]
-        mov [rdi], rax
-        mov [rdi + 8], rdx
-        add rsi, 16                           ; each auxv entry is a key/value pair (16 bytes), unlike the 8-byte pointer entries in argv/envp
-        add rdi, 16
-        test rax, rax
-        jnz .copyAuxScratch                   ; AT_NULL (key = 0) is the auxv terminator, same zero-check idiom as the pointer sized loops above
-    lea rax, [argvScratch]
-    mov [targetArgv], rax                     ; stack.inc reads targetArgv from here when rebuilding the final target stack
+    mov [rsp + 24], rax
+    lea rax, [rsp + 24]
+    mov [targetArgv], rax
 
-    ; Debug tracing follows the same simple env switch as halfshelf
-    mov byte [debugEnabled], 0
-    mov rbx, [targetEnvp]                     ; rbx walks the envp pointer array looking for HALFSHELF_DEBUG
-    .scanDebugEnv:
-        mov rdi, [rbx]
-        test rdi, rdi
-        jz .debugEnvDone                      ; reached the end of envp without finding HALFSHELF_DEBUG, tracing stays off
-        lea rsi, [debugEnvPrefix]             ; the HALFSHELF_DEBUG= literal from rodata.inc
-        mov rdx, debugEnvPrefixLen            ; length of HALFSHELF_DEBUG=
-        .debugEnvCmp:
-            test rdx, rdx                     ; same manual byte compare as the --memfd checks above
-            jz .debugEnvMatched
-            mov al, [rdi]
-            mov cl, [rsi]
-            cmp al, cl
-            jne .debugEnvNext
-            inc rdi
-            inc rsi
-            dec rdx
-            jmp .debugEnvCmp
-        .debugEnvMatched:
-            mov al, [rdi]
-            test al, al
-            jz .debugEnvNext
-            cmp al, '0'                       ; empty value or a literal 0 both count as disabled, anything else turns tracing on
-            je .debugEnvNext
-            mov byte [debugEnabled], 1
-            lea rsi, [versionMsg]             ; re-announce the loader version whenever tracing turns on, useful when comparing behavior across builds
-            mov rdx, versionMsgLen
-            call debugWrite                   ; debugEnabled was just set above, so this is the earliest trace line that actually gets printed
-            lea rsi, [dbgEnabledMsg]
-            mov rdx, dbgEnabledMsgLen
-            call debugWrite
-            jmp .debugEnvDone
-        .debugEnvNext:
-        add rbx, 8
-        jmp .scanDebugEnv
-    .debugEnvDone:
+    mov rbx, [targetEnvp]
+    call scanDebugEnv
     ; Read the metadata sidecar first so we know exactly how large the runtime
     ; mapping must be and where the stripped payload bytes belong in it
     mov rdi, [metaPath]                       
@@ -167,29 +81,47 @@ entry $
     mov [metaFd], rax
 
     mov rdi, rax                              ; opened metadata sidecar fd
-    lea rsi, [interpStat]                     ; interpStat/interpBuffer are the shared PT_INTERP scratch fields from rwdata.inc, repurposed here since this variant never loads a interpreter
+    lea rsi, [metaStat]
     mov rax, SYS_FSTAT
     syscall
     test rax, rax
     js fstatFailed
 
-    cmp qword [interpStat.st_size], BUFFER_SIZE  ; metadata sidecar shares the same fixed staging cap as the payload rather than getting its own buffer
-    jg fileTooLarge
+    cmp qword [metaStat.st_size], BUFFER_SIZE    ; one byte is kept free for the NUL terminator below
+    jge fileTooLarge
 
     mov rdi, [metaFd]                         ; sidecar fd
-    lea rsi, [interpBuffer]                   
-    mov rdx, [interpStat.st_size]              
+    lea rsi, [metaBuffer]
+    mov rdx, [metaStat.st_size]
     mov rax, SYS_READ
     syscall
-    cmp rax, [interpStat.st_size]             ; short reads are treated as failure to keep the flow simple
+    cmp rax, [metaStat.st_size]               ; short reads are treated as failure to keep the flow simple
     jne metaReadFailed
 
-    lea rsi, [interpBuffer]
-    mov rcx, [interpStat.st_size]
+    lea rsi, [metaBuffer]
+    mov rcx, [metaStat.st_size]
     add rsi, rcx
     mov byte [rsi], 0                         ; NUL terminate the staged bytes so the text format scanners below can detect instead of reading past it
 
     call parseMetaDispatch
+
+    ; Both metadata formats get the same checks here, so a hand edited text
+    ; sidecar cannot get past anything the binary one would reject
+    movzx eax, word [ehdr.phentsize]
+    cmp eax, sizeof.PHDR
+    jne invalidMeta
+    mov rax, [loadFilesz]
+    cmp rax, [loadMemsz]
+    ja invalidMeta                            ; the file part cannot be bigger than the whole segment
+    mov rdx, [headerSpan]
+    cmp rdx, rax
+    ja invalidMeta                            ; the stripped header span is a prefix of load_filesz
+    movzx eax, word [ehdr.phnum]
+    imul eax, sizeof.PHDR
+    sub rdx, rax
+    jb invalidMeta
+    cmp [phoffValue], rdx
+    ja invalidMeta                            ; the phdr table has to end inside the header span
 
     mov rdi, [metaFd]                         ; sidecar fd, closed once fully parsed
     mov rax, SYS_CLOSE
@@ -200,23 +132,11 @@ entry $
     ;
     ; File mode stages the payload exactly like the original headless variant.
     ; Memfd mode instead drains stdin into the same staging buffer while also
-    ; mirroring those bytes into a memfd descriptor. The memfd is not strictly 
-    ; required for the loader to execute
-    mov rax, [rsp + 16]                       ; re-derives the --memfd check from argv[1] again, no flag was kept from the first check above
-    mov rbx, rax                              ; same argv[1] snapshot as the mode check above
-    lea rdi, [memfdArg]                       ; re-checked against the same --memfd literal
-    mov rcx, memfdArgLen
-    .checkMemfdPayloadMode:
-        test rcx, rcx                         ; same compare loop as the mode probe above
-        jz .readPayloadFromMemfd
-        mov al, [rbx]
-        mov dl, [rdi]
-        cmp al, dl
-        jne .readPayloadFromFile
-        inc rbx
-        inc rdi
-        dec rcx
-        jmp .checkMemfdPayloadMode
+    ; mirroring those bytes into a memfd descriptor. The mirror is only there
+    ; to show the payload living in a memfd for the article. Nothing reads it
+    ; back, the image is always copied from buffer
+    cmp byte [memfdMode], 0
+    jne .readPayloadFromMemfd
 
     .readPayloadFromFile:
     mov rdi, [targetPath]                        
@@ -257,7 +177,6 @@ entry $
     syscall
     test rax, rax
     js openFailed
-    mov [payloadMemFd], rax                   ; for reference only, targetFd carries the same value forward for every read/write below
     mov [targetFd], rax
     xor r12, r12                                 ; total number of payload bytes staged so far
     .stdinReadLoop:
@@ -342,9 +261,6 @@ entry $
     test rax, rax
     js mprotectFailed
 
-    mov byte [hasInterp], 0                   ; this headless variant never has a PT_INTERP to find, but the shared reloc/stack code still checks this flag
-    lea rax, [phdrBlob]
-    mov [phdrBlobAddr], rax                   ; runtime pointer stack.inc/reloc.inc use when they need the decoded phdr bytes directly rather than walking the mapped image
     mov rax, [baseAddr]
     add rax, [phoffValue]
     mov [phdrRuntime], rax                    ; becomes the AT_PHDR value the target's own libc startup code looks for in auxv
@@ -379,14 +295,11 @@ allocateStack:
     mov rdx, dbgStackMsgLen
     mov rax, [stackAddr]
     call debugPrintHexLine
-    jmp interp                                ; hands off into the shared reloc/TLS/stack pipeline from here, same entry point halfshelf uses
+    jmp relocate                              ; hands off into the shared reloc/TLS/stack pipeline from here, same entry point halfshelf uses
 
 include "loader/reloc.inc"                    ; shared with halfshelf, handles PT_DYNAMIC RELA/JMPREL relocations against baseAddr
-loadInterp:
-    jmp unsupportedInterp                     ; reloc.inc's shared interp: entry still falls through here since headless SHELF images never carry PT_INTERP
 include "loader/stack.inc"                    ; shared with halfshelf, builds the target's TLS block and synthetic stack, then jumps to the entry point
-forkTransformExec:
-    jmp unsupportedType                       ; only a single ET_DYN PT_LOAD SHELF image is supported, anything needing a fork/exec transform bails here
+include "loader/common.inc"                   ; shared debug tracing, error exits and exit
 
 parseMetaDispatch:
     ; Metadata sidecars come in two formats now:
@@ -395,13 +308,13 @@ parseMetaDispatch:
     ;
     ; Autodetecting the magic keeps the runtime loader interface stable while
     ; letting the helper tools pick whichever encoding is more convenient
-    lea rsi, [interpBuffer]                      ; first byte of the staged metadata sidecar
+    lea rsi, [metaBuffer]                      ; first byte of the staged metadata sidecar
     lea rdi, [metaMagic]
     mov rcx, metaMagicLen
     call tryPrefix
     cmp rax, 1
     je parseMetaText
-    lea rsi, [interpBuffer]
+    lea rsi, [metaBuffer]
     lea rdi, [metaBinMagic]
     mov rcx, metaBinMagicLen
     call tryPrefix
@@ -411,7 +324,7 @@ parseMetaDispatch:
 
 parseMetaText:
     ; each field below repeats the same shape: a fixed key literal, then a hex value up to the trailing newline
-    lea rsi, [interpBuffer]
+    lea rsi, [metaBuffer]
     lea rdi, [metaMagic]                      ; re-verifies the exact magic bytes tryPrefix already matched in parseMetaDispatch, this can't actually fail but keeps the two code paths symmetric
     mov rcx, metaMagicLen
     call expectPrefix
@@ -540,10 +453,10 @@ parseMetaBin:
     ; Binary metadata is a fixed little-endian record followed by the raw phdr
     ; table bytes. Because the loader itself runs on little-endian x64, the
     ; parser can read those qwords directly from memory after range checks
-    mov rax, [interpStat.st_size]                
+    mov rax, [metaStat.st_size]                
     cmp rax, metaBinFixedSize                    ; the fixed size binary header must fit before we read any fields
     jb invalidMeta
-    lea rsi, [interpBuffer + metaBinMagicLen]    ; skip the 8 byte "SHELFBN1" magic prefix
+    lea rsi, [metaBuffer + metaBinMagicLen]    ; skip the 8 byte "SHELFBN1" magic prefix
 
     mov rax, [rsi]
     mov [ehdr.entry], rax                     ; same entry field as the text format, decoded from a raw qword instead of ASCII hex
@@ -558,8 +471,8 @@ parseMetaBin:
     mov word [ehdr.phnum], ax
     add rsi, 8
     mov rax, [rsi]
-    cmp rax, sizeof.PHDR                         ; SHELFBN1 carries ELF64 PHDR records
-    jne invalidMeta
+    cmp rax, 0xffff                              ; 16 bit field too, the exact size is checked after parsing
+    ja invalidMeta
     mov word [ehdr.phentsize], ax
     add rsi, 8
     mov rax, [rsi]
@@ -578,8 +491,6 @@ parseMetaBin:
     add rsi, 8
     mov rax, [rsi]
     mov [loadMemsz], rax
-    cmp rax, [loadFilesz]
-    jb invalidMeta                            ; memsz can't be smaller than filesz, the file part can't exceed the total mapped size
     add rsi, 8
     mov eax, [rsi]
     mov dword [loadFlags], eax
@@ -611,11 +522,11 @@ parseMetaBin:
     imul rax, rcx
     cmp r8, rax                                  ; declared phdr blob size must match phnum * phentsize exactly
     jne invalidMeta
-    mov rax, [interpStat.st_size]
+    mov rax, [metaStat.st_size]
     sub rax, metaBinFixedSize                    ; number of bytes after the fixed binary header
     cmp rax, r8                                  ; fixed record + PHDR blob is the complete file and trailing bytes are invalid
     jne invalidMeta
-    lea rsi, [interpBuffer + metaBinFixedSize]   ; first raw program header byte in the binary metadata sidecar
+    lea rsi, [metaBuffer + metaBinFixedSize]   ; first raw program header byte in the binary metadata sidecar
     lea rdi, [phdrBlob]                          ; scratch buffer that later synthesizeHeaders copies from
     mov rcx, r8                                  ; number of phdr bytes to copy
     rep movsb
@@ -749,6 +660,8 @@ decodeHexBlobLine:
         je .done
         test al, al
         jz invalidMeta                        ; same truncated value guard as parseHexLine's NUL check
+        cmp r8, 4096                          ; phdrBlob size, the same cap the binary format enforces
+        jae invalidMeta
         call parseNibble
         shl al, 4
         mov bl, al
@@ -793,165 +706,16 @@ parseNibble:
     sub al, '0'
     ret
 
-; from here down, each named failure just loads its own message text and falls into the shared writeError sink below
-unsupportedType:
-    lea rsi, [unsupportedTypeMsg]
-    mov rdx, unsupportedTypeMsgLen
-    jmp writeError
-
-unsupportedInterp:
-    lea rsi, [unsupportedInterpMsg]
-    mov rdx, unsupportedInterpMsgLen
-    jmp writeError
-
-unsupportedReloc:                             ; every jump here comes from reloc.inc, not this file directly
-    lea rsi, [unsupportedRelocMsg]
-    mov rdx, unsupportedRelocMsgLen
-    jmp writeError
-
+; Error exits only headshelf reaches, the shared ones live in loader/common.inc
 invalidMeta:
     lea rsi, [invalidMetaMsg]
     mov rdx, invalidMetaMsgLen
-    jmp writeError
-
-stackStorageTooSmall:                         ; reached from stack.inc when the copied argv/env/aux strings overflow STACK_STORAGE_SIZE
-    lea rsi, [stackStorageTooSmallMsg]
-    mov rdx, stackStorageTooSmallMsgLen
-    jmp writeError
-
-openFailed:                                 ; shared by every open()/memfd_create() call site in this file
-    lea rsi, [openFailedMsg]
-    mov rdx, openFailedMsgLen
-    jmp writeError
-
-fstatFailed:                                  ; shared by both the metadata sidecar fstat and the payload fstat
-    lea rsi, [fstatFailedMsg]
-    mov rdx, fstatFailedMsgLen
-    jmp writeError
-
-fileTooLarge:                                 ; covers an oversized metadata sidecar, an oversized file mode payload, and memfd mode's buffer exhaustion, three different call sites and one message
-    lea rsi, [fileTooLargeMsg]
-    mov rdx, fileTooLargeMsgLen
-    jmp writeError
-
-fileReadFailed:
-    lea rsi, [fileReadFailedMsg]
-    mov rdx, fileReadFailedMsgLen
     jmp writeError
 
 metaReadFailed:
     lea rsi, [metaReadFailedMsg]
     mov rdx, metaReadFailedMsgLen
     jmp writeError
-
-closeFailed:                                  ; only the metadata sidecar close is checked here, the payload/stripped image fd is left open once its bytes are copied into the mapping
-    lea rsi, [closeFailedMsg]
-    mov rdx, closeFailedMsgLen
-    jmp writeError
-
-mmapFailed:                                   ; shared between the main image reservation and the synthetic stack reservation below
-    lea rsi, [mmapFailedMsg]
-    mov rdx, mmapFailedMsgLen
-    jmp writeError
-
-mprotectFailed:
-    lea rsi, [mprotectFailedMsg]
-    mov rdx, mprotectFailedMsgLen
-    jmp writeError
-
-archPrctlFailed:                              ; reached from stack.inc's arch_prctl(2) call when setting up the target's TLS FS base
-    lea rsi, [archPrctlFailedMsg]
-    mov rdx, archPrctlFailedMsgLen
-    jmp writeError
-
-writeError:
-    mov rdi, STDERR                              ; headless mode diagnostics should not mix with payload stdout
-    mov rax, SYS_WRITE
-    syscall
-    mov [exitStatus], 1                       ; every failure path in this file funnels through here with the same exit status
-    jmp exit
-
-; no-op unless HALFSHELF_DEBUG turned tracing on above, callers don't need to guard each trace call themselves
-debugWrite:
-    cmp byte [debugEnabled], 0
-    je .done
-    push rax
-    push rdi
-    push rcx
-    push r11                                  ; rcx/r11 get clobbered by the syscall instruction itself, not just by whatever write() does
-    mov rdi, STDERR                           ; rsi/rdx (message pointer/length) are set by the caller before this call
-    mov rax, SYS_WRITE
-    syscall
-    pop r11
-    pop rcx
-    pop rdi
-    pop rax
-    .done:
-    ret
-
-; formats an 8 byte value as 0x plus 16 hex digits into a scratch buffer, then reuses debugWrite's gate
-debugPrintHexLine:
-    cmp byte [debugEnabled], 0
-    je .done
-    push rax                                  ; rax holds the value to hex encode, the SYS_WRITE two lines down clobbers it with a return code, so it gets saved here and restored before the hex loop runs
-    push rbx
-    push rcx
-    push rdx
-    push rsi
-    push rdi
-    push r8
-    push r11
-    mov rdi, STDERR
-    mov rax, SYS_WRITE
-    syscall                                   ; this first write is the caller's label text (rsi/rdx as passed in), rax and friends get restored right after so the original value to print survives it
-    pop r11
-    pop r8
-    pop rdi
-    pop rsi
-    pop rdx
-    pop rcx
-    pop rbx
-    pop rax
-    push rax                                  ; pushed again only to protect the caller's other registers across the write below, rax itself is about to be consumed by the hex loop, not saved
-    push rbx
-    push rcx
-    push rdx
-    push rsi
-    push rdi
-    push r8
-    push r11
-    lea rdi, [debugHexBuf]
-    mov byte [rdi], '0'
-    mov byte [rdi + 1], 'x'
-    lea rsi, [hexDigits]                      ; the 0123456789abcdef lookup table in rodata
-    mov rbx, rax
-    lea rdi, [debugHexBuf + 2]
-    mov rcx, 16                               ; 16 nibbles = 8 bytes = one 64 bit register in hex
-    .hexLoop:
-        mov r8, rbx
-        shr r8, 60
-        mov dl, [rsi + r8]
-        mov [rdi], dl
-        inc rdi
-        shl rbx, 4
-        dec rcx
-        jnz .hexLoop                          ; loops exactly 16 times, one hex nibble per iteration
-    mov byte [rdi], 10                        ; newline caps the fixed 19 byte line: 0x, 16 digits, and a newline
-    mov rdi, STDERR
-    lea rsi, [debugHexBuf]
-    mov rdx, 19
-    mov rax, SYS_WRITE
-    syscall
-    pop r11
-    pop r8
-    pop rdi
-    pop rsi
-    pop rdx
-    pop rcx
-    pop rbx
-    pop rax
-    .done:
-    ret
 
 usage:
     ; usage errors show both the version banner and the usage text, the same version line HALFSHELF_DEBUG prints above
@@ -968,11 +732,6 @@ usage:
     mov [exitStatus], 1                       ; usage still exits nonzero, since it was triggered by insufficient arguments
     jmp exit
 
-exit:
-    mov dil, byte [exitStatus]                ; only the low byte matters
-    mov rax, SYS_EXIT
-    syscall
-
 segment readable
 include "loader/rodata.inc"                   
 husageMsg            db "Usage: headshelf <payload-file> <meta-file> [args...]", 0xa, \  
@@ -983,7 +742,7 @@ metaMagicLen         = $ - metaMagic
 metaBinMagic         db "SHELFBN1"            ; binary sidecar's identifier, distinguishes it from SHELFMETA1 during autodetection
 metaBinMagicLen      = $ - metaBinMagic
 metaBinFixedSize     = metaBinMagicLen + (17 * 8)  ; 17 qword fields follow the magic: entry, phoff, phnum, phentsize, header_span, load_offset, load_vaddr, load_filesz, load_memsz, load_flags, dynamic_vaddr, dynamic_memsz, tls_vaddr, tls_filesz, tls_memsz, tls_align, phdr_blob_size, matching parseMetaBin's field order
-memfdArg             db "--memfd"             
+memfdArg             db "--memfd", 0          ; the NUL makes the mode check an exact match
 memfdArgLen          = $ - memfdArg
 memfdName            db "shelf_payload", 0
 memfdTargetPath      db "memfd:shelf", 0      ; fake argv[0] handed to the loaded payload in --memfd mode

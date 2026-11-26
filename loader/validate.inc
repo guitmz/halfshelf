@@ -16,26 +16,22 @@
     jne invalidLayout
     cmp word [ehdr.phentsize], sizeof.PHDR        ; each phdr entry must match our native ELF64 program header layout
     jne invalidLayout
-
-    ; Clear state that later phases will fill in again. This variant is much
-    ; narrower than the root loader, so several fields are expected to remain
-    ; zero for a valid SHELF image 
-    mov qword [interpPathPtr], 0                  ; forget any previously seen PT_INTERP path pointer
-    mov qword [interpBaseAddr], 0                ; forget any previously computed interpreter load bias
-    mov qword [imageMinVaddr], -1                ; sentinel = no PT_LOAD has been seen yet
-    mov qword [imageMaxVaddr], 0                ; running maximum PT_LOAD end address starts at zero
-    mov qword [imageSpanSize], 0                  ; no reserved ET_DYN has been computed yet
-    mov qword [loadCount], 0                      ; no PT_LOAD segments have been seen in this candidate SHELF image yet
+    ; The whole phdr table must sit inside the staged file, every later walk
+    ; reads it straight out of buffer
+    movzx eax, word [ehdr.phnum]
+    imul eax, sizeof.PHDR
+    mov rdx, [fstat.st_size]
+    sub rdx, rax
+    jb invalidLayout
+    cmp [ehdr.phoff], rdx
+    ja invalidLayout
 
     ; A SHELF image here is expected to be ET_DYN only
-    cmp [ehdr.type], ET_DYN
-    jne .notDyn
-    lea rsi, [dbgDynMsg]                          
-    mov rdx, dbgDynMsgLen                         
+    cmp word [ehdr.type], ET_DYN
+    jne unsupportedType
+    lea rsi, [dbgDynMsg]
+    mov rdx, dbgDynMsgLen
     call debugWrite
-    jmp scanDynImage
-    .notDyn:
-    jmp unsupportedType
 
 ; SHELF pre scan.
 ;
@@ -48,7 +44,6 @@
 scanDynImage:
     mov [baseAddr], 0
     mov qword [phdrRuntime], 0
-    mov byte [hasInterp], 0
     mov byte [hasDynamic], 0
     mov byte [hasTls], 0
     mov byte [stackProt], PROT_READ or PROT_WRITE
