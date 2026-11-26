@@ -25,9 +25,6 @@ dbgStackBuildMsgLen = $ - dbgStackBuildMsg
 dbgJumpMainMsg      db "halfshelf: jumping to SHELF entry = "
 dbgJumpMainMsgLen   = $ - dbgJumpMainMsg
 
-dbgJumpInterpMsg    db "halfshelf: PT_INTERP path is not part of this variant"
-dbgJumpInterpMsgLen = $ - dbgJumpInterpMsg
-
 versionMsg    db "halfshelf: SHELF focused userland exec loader v0.0.1 by TMZ (c) 2026", 0xa
 versionMsgLen = $ - versionMsg
 usageMsg      db "Usage: halfshelf <path-to-shelf-elf>", 0xa
@@ -71,8 +68,8 @@ closeFailedMsg             db "halfshelf: finished loading, but close(2) on the 
 closeFailedMsgLen          = $ - closeFailedMsg
 mmapFailedMsg              db "halfshelf: mmap(2) failed while laying out the SHELF image", 0xa
 mmapFailedMsgLen           = $ - mmapFailedMsg
-phdrReadFailedMsg          db "halfshelf: could not read a program header from disk", 0xa
-phdrReadFailedMsgLen       = $ - phdrReadFailedMsg
+invalidTlsMsg              db "halfshelf: PT_TLS initializer is larger than the TLS block", 0xa
+invalidTlsMsgLen           = $ - invalidTlsMsg
 mprotectFailedMsg          db "halfshelf: mprotect(2) rejected the final segment permissions", 0xa
 mprotectFailedMsgLen       = $ - mprotectFailedMsg
 archPrctlFailedMsg         db "halfshelf: arch_prctl(2) failed while installing PT_TLS state", 0xa

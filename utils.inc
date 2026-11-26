@@ -75,7 +75,7 @@ STACK_SIZE          = 8388608 ; 8*1024*1024
 TLS_TCB_SIZE        = 0x1000    ; space reserved for the thread control block that sits just before the %fs base this loader points at
 TLS_DTV_SIZE        = 0x30     ; dynamic thread vector header, only the generation counter and slot 0 are ever populated since this loader never calls dlopen
 STACK_STORAGE_SIZE  = 0x5000
-STACK_STRING_SIZE   = 0x5000
+STACK_STRING_SIZE   = 0x40000 ; 256 KB of argv/env strings, even all 1 byte strings need only 2 MB of pointer tables, which stay clear of the string area
 ; Convert ELF PF_* bits into Linux PROT_* bits.
 ;
 ; The numbering does not line up, which is an easy way to ruin a loader on a
